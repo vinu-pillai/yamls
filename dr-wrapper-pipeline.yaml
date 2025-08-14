@@ -1,0 +1,295 @@
+# GenAI DR Master Pipeline - Sequential Infrastructure Provisioning
+trigger: none  # Manual trigger only for DR drills
+
+pr: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: 'genai-dr-variables'  # Variable group with common settings
+  - name: TARGET_REGION
+    value: 'europe-west3'
+  - name: PROJECT_ID
+    value: 'your-project-id'
+  - name: ENVIRONMENT
+    value: 'dr'
+
+stages:
+# Stage 1: Terraform Init & Plan
+- stage: TerraformInitPlan
+  displayName: '1. Terraform Init & Plan (west3)'
+  jobs:
+  - job: TerraformPlan
+    displayName: 'Initialize and Plan Infrastructure'
+    steps:
+    - task: TerraformInstaller@0
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: 'latest'
+    
+    - task: TerraformTaskV2@2
+      displayName: 'Terraform Init'
+      inputs:
+        provider: 'gcp'
+        command: 'init'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform/dr'
+        backendServiceGCP: 'gcp-service-connection'
+        backendGCPBucketName: 'terraform-state-dr-bucket'
+        backendGCPPrefix: 'dr/west3'
+    
+    - task: TerraformTaskV2@2
+      displayName: 'Terraform Plan'
+      inputs:
+        provider: 'gcp'
+        command: 'plan'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform/dr'
+        environmentServiceNameGCP: 'gcp-service-connection'
+        commandOptions: '-var="region=$(TARGET_REGION)" -var="project_id=$(PROJECT_ID)" -var="environment=$(ENVIRONMENT)" -out=tfplan'
+
+# Stage 2: VPC and Networking
+- stage: NetworkProvisioning
+  displayName: '2. Provision VPC & Networking'
+  dependsOn: TerraformInitPlan
+  condition: succeeded()
+  jobs:
+  - job: DeployNetworking
+    displayName: 'Deploy Network Components'
+    steps:
+    - task: TerraformTaskV2@2
+      displayName: 'Apply Network Infrastructure'
+      inputs:
+        provider: 'gcp'
+        command: 'apply'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform/dr/networking'
+        environmentServiceNameGCP: 'gcp-service-connection'
+        commandOptions: '-var="region=$(TARGET_REGION)" -var="project_id=$(PROJECT_ID)" -auto-approve'
+    
+    - task: GoogleCloudSdkTool@0
+      displayName: 'Install gcloud SDK'
+    
+    - task: Bash@3
+      displayName: 'Verify Network Connectivity'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Authenticate with GCP
+          gcloud auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS
+          gcloud config set project $(PROJECT_ID)
+          
+          # Verify VPC creation
+          echo "Verifying VPC network..."
+          gcloud compute networks describe genai-dr-vpc --format="value(selfLink)"
+          
+          # Verify subnet creation  
+          echo "Verifying subnet..."
+          gcloud compute networks subnets describe genai-dr-subnet --region=$(TARGET_REGION) --format="value(selfLink)"
+
+# Stage 3: AlloyDB Deployment
+- stage: AlloyDBDeployment
+  displayName: '3. Deploy AlloyDB Cluster'
+  dependsOn: NetworkProvisioning
+  condition: succeeded()
+  jobs:
+  - job: DeployAlloyDB
+    displayName: 'Create AlloyDB Cluster'
+    timeoutInMinutes: 60  # AlloyDB creation can take 30-45 minutes
+    steps:
+    - task: TerraformTaskV2@2
+      displayName: 'Deploy AlloyDB Infrastructure'
+      inputs:
+        provider: 'gcp'
+        command: 'apply'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform/dr/database'
+        environmentServiceNameGCP: 'gcp-service-connection'
+        commandOptions: '-var="region=$(TARGET_REGION)" -var="project_id=$(PROJECT_ID)" -auto-approve'
+    
+    - task: Bash@3
+      displayName: 'Verify AlloyDB Cluster Health'
+      inputs:
+        targetType: 'inline'
+        script: |
+          gcloud auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS
+          gcloud config set project $(PROJECT_ID)
+          
+          # Wait for AlloyDB cluster to be ready
+          echo "Waiting for AlloyDB cluster to be ready..."
+          timeout 1800 bash -c '
+            while [[ "$(gcloud alloydb clusters describe genai-alloydb-cluster-dr --region=$(TARGET_REGION) --format="value(state)")" != "READY" ]]; do
+              echo "AlloyDB cluster status: $(gcloud alloydb clusters describe genai-alloydb-cluster-dr --region=$(TARGET_REGION) --format="value(state)")"
+              sleep 30
+            done
+            echo "AlloyDB cluster is ready!"
+          '
+          
+          # Get AlloyDB IP for next stages
+          ALLOYDB_IP=$(gcloud alloydb instances describe genai-primary-instance-dr --cluster=genai-alloydb-cluster-dr --region=$(TARGET_REGION) --format="value(ipAddress)")
+          echo "##vso[task.setvariable variable=ALLOYDB_IP;isOutput=true]$ALLOYDB_IP"
+      name: 'alloydb_output'
+
+# Stage 4: Cloud Run Service
+- stage: CloudRunDeployment
+  displayName: '4. Create Cloud Run Service'
+  dependsOn: AlloyDBDeployment
+  condition: succeeded()
+  variables:
+    ALLOYDB_IP: $[ stageDependencies.AlloyDBDeployment.DeployAlloyDB.outputs['alloydb_output.ALLOYDB_IP'] ]
+  jobs:
+  - job: DeployCloudRun
+    displayName: 'Deploy GenAI Application'
+    steps:
+    - task: TerraformTaskV2@2
+      displayName: 'Deploy Cloud Run Service'
+      inputs:
+        provider: 'gcp'
+        command: 'apply'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform/dr/cloudrun'
+        environmentServiceNameGCP: 'gcp-service-connection'
+        commandOptions: '-var="region=$(TARGET_REGION)" -var="project_id=$(PROJECT_ID)" -var="db_host=$(ALLOYDB_IP)" -auto-approve'
+    
+    - task: Bash@3
+      displayName: 'Verify Cloud Run Deployment'
+      inputs:
+        targetType: 'inline'
+        script: |
+          gcloud auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS
+          gcloud config set project $(PROJECT_ID)
+          
+          # Wait for Cloud Run service to be ready
+          echo "Checking Cloud Run service status..."
+          SERVICE_URL=$(gcloud run services describe genai-application --region=$(TARGET_REGION) --format="value(status.url)")
+          echo "Service URL: $SERVICE_URL"
+          
+          # Basic health check
+          timeout 300 bash -c '
+            while ! curl -f "$SERVICE_URL/health" > /dev/null 2>&1; do
+              echo "Waiting for application to respond..."
+              sleep 10
+            done
+            echo "Application is responding!"
+          '
+          
+          echo "##vso[task.setvariable variable=SERVICE_URL;isOutput=true]$SERVICE_URL"
+      name: 'cloudrun_output'
+
+# Stage 5: Load Balancer Configuration
+- stage: LoadBalancerSetup
+  displayName: '5. Setup Load Balancer'
+  dependsOn: CloudRunDeployment
+  condition: succeeded()
+  variables:
+    SERVICE_URL: $[ stageDependencies.CloudRunDeployment.DeployCloudRun.outputs['cloudrun_output.SERVICE_URL'] ]
+  jobs:
+  - job: ConfigureLoadBalancer
+    displayName: 'Configure Global Load Balancer'
+    steps:
+    - task: TerraformTaskV2@2
+      displayName: 'Deploy Load Balancer Infrastructure'
+      inputs:
+        provider: 'gcp'
+        command: 'apply'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform/dr/loadbalancer'
+        environmentServiceNameGCP: 'gcp-service-connection'
+        commandOptions: '-var="region=$(TARGET_REGION)" -var="project_id=$(PROJECT_ID)" -var="service_url=$(SERVICE_URL)" -auto-approve'
+    
+    - task: Bash@3
+      displayName: 'Configure Backend Services'
+      inputs:
+        targetType: 'inline'
+        script: |
+          gcloud auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS
+          gcloud config set project $(PROJECT_ID)
+          
+          # Add west3 backend to existing load balancer
+          echo "Adding west3 backend to load balancer..."
+          gcloud compute backend-services add-backend genai-backend-service \
+            --global \
+            --group=genai-cloudrun-neg-west3 \
+            --group-zone=$(TARGET_REGION) \
+            --project=$(PROJECT_ID)
+          
+          # Verify backend health
+          gcloud compute backend-services get-health genai-backend-service \
+            --global --project=$(PROJECT_ID)
+
+# Stage 6: IAM and Security
+- stage: IAMSecurityConfig
+  displayName: '6. Configure IAM & Security'
+  dependsOn: LoadBalancerSetup
+  condition: succeeded()
+  jobs:
+  - job: ConfigureSecurity
+    displayName: 'Setup IAM and Security Policies'
+    steps:
+    - task: TerraformTaskV2@2
+      displayName: 'Apply IAM Configuration'
+      inputs:
+        provider: 'gcp'
+        command: 'apply'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/terraform/dr/iam'
+        environmentServiceNameGCP: 'gcp-service-connection'
+        commandOptions: '-var="region=$(TARGET_REGION)" -var="project_id=$(PROJECT_ID)" -auto-approve'
+    
+    - task: Bash@3
+      displayName: 'Validate Security Configuration'
+      inputs:
+        targetType: 'inline'
+        script: |
+          gcloud auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS
+          gcloud config set project $(PROJECT_ID)
+          
+          # Verify service account permissions
+          echo "Verifying service account permissions..."
+          gcloud projects get-iam-policy $(PROJECT_ID) \
+            --flatten="bindings[].members" \
+            --filter="bindings.members:genai-service-account-dr@$(PROJECT_ID).iam.gserviceaccount.com"
+          
+          # Test Cloud Armor rules
+          echo "Verifying Cloud Armor security policies..."
+          gcloud compute security-policies describe genai-security-policy-dr
+
+# Final Stage: Validation and Reporting
+- stage: ValidationReporting
+  displayName: '7. Final Validation & Reporting'
+  dependsOn: IAMSecurityConfig
+  condition: succeeded()
+  jobs:
+  - job: FinalValidation
+    displayName: 'Complete Infrastructure Validation'
+    steps:
+    - task: Bash@3
+      displayName: 'Comprehensive Health Check'
+      inputs:
+        targetType: 'inline'
+        script: |
+          gcloud auth activate-service-account --key-file=$GOOGLE_APPLICATION_CREDENTIALS
+          gcloud config set project $(PROJECT_ID)
+          
+          echo "=== DR Infrastructure Validation Report ==="
+          echo "Timestamp: $(date)"
+          echo "Region: $(TARGET_REGION)"
+          echo "Project: $(PROJECT_ID)"
+          echo ""
+          
+          # Check all components
+          echo "1. AlloyDB Cluster Status:"
+          gcloud alloydb clusters describe genai-alloydb-cluster-dr --region=$(TARGET_REGION) --format="value(state)"
+          
+          echo "2. Cloud Run Service Status:"
+          gcloud run services describe genai-application --region=$(TARGET_REGION) --format="value(status.conditions[0].status)"
+          
+          echo "3. Load Balancer Backend Health:"
+          gcloud compute backend-services get-health genai-backend-service --global
+          
+          echo "4. End-to-End Application Test:"
+          curl -f "$(gcloud run services describe genai-application --region=$(TARGET_REGION) --format="value(status.url)")/health" && echo "✅ SUCCESS" || echo "❌ FAILED"
+          
+          echo ""
+          echo "=== DR Infrastructure Provisioning Complete ==="
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish DR Validation Report'
+      inputs:
+        PathtoPublish: '$(Agent.TempDirectory)'
+        ArtifactName: 'dr-validation-report'
+        publishLocation: 'Container'
