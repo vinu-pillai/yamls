@@ -1,0 +1,81 @@
+# master-infra-dr-wrapper.yaml
+name: DR-Wrap-$(Date:yyyyMMdd)$(Rev:.r)
+trigger: none
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  # Friendly names (or use numeric IDs if you prefer)
+  PIPE_ALLOYDB: 'infra-alloydb'
+  PIPE_GCS: 'infra-gcs-bucket'
+  PIPE_CLOUDRUN: 'infra-cloudrun'
+  PIPE_LB: 'infra-loadbalancer'
+
+  # Optional parameters to pass to child pipelines
+  REGION: 'europe-west3'
+  ENV: 'dr'
+
+steps:
+  - script: az extension add -n azure-devops
+    displayName: Install Azure DevOps CLI extension
+
+  - script: |
+      echo "$(AZDO_PAT)" | az devops login
+      az devops configure --defaults organization=https://dev.azure.com/<YOUR_ORG> project=<YOUR_PROJECT>
+    displayName: Authenticate az devops (PAT)
+
+  - script: az pipelines list --output table
+    displayName: List pipelines (sanity check)
+
+  # Helper: function to run a pipeline and wait for completion
+  - bash: |
+      set -euo pipefail
+
+      run_and_wait () {
+        local PIPE_NAME="$1"
+        local REGION="$2"
+        local ENV="$3"
+
+        echo "Queuing pipeline: ${PIPE_NAME}"
+        # Start the run; capture the run ID
+        RUN_JSON=$(az pipelines run \
+          --name "${PIPE_NAME}" \
+          --variables region="${REGION}" env="${ENV}" \
+          --output json)
+        RUN_ID=$(echo "$RUN_JSON" | jq -r '.id')
+        echo "Queued run id: ${RUN_ID}"
+
+        echo "Waiting for completion..."
+        # Poll status until completed/canceled/failed
+        while true; do
+          STATE=$(az pipelines runs show --id "${RUN_ID}" --query state -o tsv)
+          RESULT=$(az pipelines runs show --id "${RUN_ID}" --query result -o tsv || echo "")
+          echo "State=${STATE} Result=${RESULT}"
+          if [[ "${STATE}" == "completed" ]]; then
+            if [[ "${RESULT}" == "succeeded" ]]; then
+              echo "✅ ${PIPE_NAME} succeeded."
+              break
+            else
+              echo "❌ ${PIPE_NAME} finished with result=${RESULT}"
+              exit 1
+            fi
+          fi
+          sleep 10
+        done
+      }
+
+      # 1) AlloyDB infra
+      run_and_wait "$(PIPE_ALLOYDB)" "$(REGION)" "$(ENV)"
+
+      # 2) GCS bucket infra
+      run_and_wait "$(PIPE_GCS)" "$(REGION)" "$(ENV)"
+
+      # 3) Cloud Run infra
+      run_and_wait "$(PIPE_CLOUDRUN)" "$(REGION)" "$(ENV)"
+
+      # 4) Load Balancer infra
+      run_and_wait "$(PIPE_LB)" "$(REGION)" "$(ENV)"
+
+      echo "All infra pipelines completed successfully."
+    displayName: Queue & wait: AlloyDB → GCS → Cloud Run → LB
